@@ -1,9 +1,9 @@
 /*
- * 金庸群侠传3D重制版 - WarpTest Checkpoint Command
- * https://github.com/jynew/jynew
+ * WarpTest checkpoint command for jynew.
  *
- * Test-gated utility for WarpTest semantic checkpoint validation.
- * Activated only via Unity batch mode: -executeMethod Jyx2.WarptestCheckpoint.Run
+ * Test-gated utility for semantic checkpoint validation.
+ * Activated only via Unity batch mode:
+ * -executeMethod Jyx2.WarptestCheckpoint.Run
  */
 
 using System;
@@ -140,23 +140,17 @@ namespace Jyx2
             var spec = request.spec;
             var target = spec.target;
 
-            // Phase 0: Initialize runtime environment (Lua tables, MOD configs)
             try
             {
                 var modId = target.mod_id;
                 if (string.IsNullOrEmpty(modId)) modId = GameConst.DEFAULT_GAME_MOD_NAME;
-
-                // Attempt async setup; if it fails, try direct Lua init
-                var setupTask = RuntimeEnvSetup.Setup();
-                // In editor batch mode, UniTask may not tick automatically;
-                // fall through and let LuaToCsBridge init lazily if needed.
+                RuntimeEnvSetup.Setup();
             }
             catch (Exception e)
             {
                 Debug.LogWarning($"[WarpTest] Runtime setup incomplete (non-fatal): {e.Message}");
             }
 
-            // Phase 1: Checkpoint restoration — load or synthesize state
             if (target.save_index >= 0)
             {
                 checks.Add(LoadSaveCheckpoint(target.save_index, target.mod_id));
@@ -172,23 +166,18 @@ namespace Jyx2
                 return new WarptestReport { status = "failure", detail = "Checkpoint restoration failed.", checks = checks };
             }
 
-            // Ensure stub roles exist for all role IDs referenced in actions/assertions
-            // so that GetRole() never returns null in minimal-init mode
             EnsureStubRolesForSpec(spec);
 
-            // Phase 2: Validation
             foreach (var validation in spec.validations)
             {
                 checks.Add(ValidateField(validation));
             }
 
-            // Phase 3: Actions
             foreach (var action in spec.actions)
             {
                 checks.Add(ExecuteAction(action));
             }
 
-            // Phase 4: Assertions
             foreach (var assertion in spec.assertions)
             {
                 checks.Add(CheckAssertion(assertion));
@@ -222,18 +211,48 @@ namespace Jyx2
 
         static void CaptureScreenshotToFile(string outputPath)
         {
+            string cameraDetail;
+            if (TryCaptureCameraToFile(outputPath, out cameraDetail))
+            {
+                Debug.Log("[WarpTest] Screenshot captured via camera render.");
+                return;
+            }
+            Debug.LogWarning($"[WarpTest] Camera screenshot capture was not informative: {cameraDetail}");
+
             if (Application.isPlaying)
             {
                 var texture = ScreenCapture.CaptureScreenshotAsTexture();
-                File.WriteAllBytes(outputPath, texture.EncodeToPNG());
-                UnityEngine.Object.Destroy(texture);
-                return;
+                try
+                {
+                    if (texture != null)
+                    {
+                        File.WriteAllBytes(outputPath, texture.EncodeToPNG());
+                        if (TextureHasVisibleRange(texture))
+                        {
+                            Debug.Log("[WarpTest] Screenshot captured via ScreenCapture.");
+                            return;
+                        }
+                    }
+                }
+                finally
+                {
+                    if (texture != null)
+                        UnityEngine.Object.Destroy(texture);
+                }
             }
 
+            if (File.Exists(outputPath))
+                File.Delete(outputPath);
+            throw new InvalidOperationException($"Unable to capture an informative Unity screenshot: {cameraDetail}");
+        }
+
+        static bool TryCaptureCameraToFile(string outputPath, out string detail)
+        {
             var camera = Camera.main ?? UnityEngine.Object.FindObjectOfType<Camera>();
             if (camera == null)
             {
-                throw new InvalidOperationException("No Unity camera is available for editor-mode screenshot capture.");
+                detail = "No Unity camera is available.";
+                return false;
             }
 
             var width = Math.Max(640, Screen.width > 0 ? Screen.width : 1280);
@@ -251,15 +270,49 @@ namespace Jyx2
                 texture.ReadPixels(new Rect(0, 0, width, height), 0, 0);
                 texture.Apply();
                 File.WriteAllBytes(outputPath, texture.EncodeToPNG());
-                UnityEngine.Object.DestroyImmediate(texture);
+                bool informative = TextureHasVisibleRange(texture);
+                DestroyCapturedObject(texture);
+                detail = informative ? "Camera render captured an informative image." : "Camera render produced a blank or flat image.";
+                return informative;
             }
             finally
             {
                 camera.targetTexture = previousTarget;
                 RenderTexture.active = previousActive;
                 renderTexture.Release();
-                UnityEngine.Object.DestroyImmediate(renderTexture);
+                DestroyCapturedObject(renderTexture);
             }
+        }
+
+        static void DestroyCapturedObject(UnityEngine.Object obj)
+        {
+            if (obj == null)
+                return;
+            if (Application.isPlaying)
+                UnityEngine.Object.Destroy(obj);
+            else
+                UnityEngine.Object.DestroyImmediate(obj);
+        }
+
+        static bool TextureHasVisibleRange(Texture2D texture)
+        {
+            if (texture == null)
+                return false;
+            var pixels = texture.GetPixels32();
+            if (pixels == null || pixels.Length == 0)
+                return false;
+            int low = 255;
+            int high = 0;
+            foreach (var pixel in pixels)
+            {
+                if (pixel.r < low) low = pixel.r;
+                if (pixel.g < low) low = pixel.g;
+                if (pixel.b < low) low = pixel.b;
+                if (pixel.r > high) high = pixel.r;
+                if (pixel.g > high) high = pixel.g;
+                if (pixel.b > high) high = pixel.b;
+            }
+            return high - low >= 8;
         }
 
         static void EnsureStubRolesForSpec(WarptestSpec spec)
@@ -333,13 +386,11 @@ namespace Jyx2
                 catch (Exception initErr)
                 {
                     Debug.LogWarning($"[WarpTest] CreateNew failed ({initErr.Message}), using minimal state");
-                    // Bypass LuaToCsBridge dependency: construct a bare GameRuntimeData via reflection
                     runtime = new GameRuntimeData();
                     var instanceField = typeof(GameRuntimeData).GetField("_instance",
                         System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static);
                     instanceField?.SetValue(null, runtime);
 
-                    // Manually create a minimal player role (id=0) without Lua config tables
                     var player = new RoleInstance();
                     player.Key = 0;
                     player.Name = "WarpTest Player";
@@ -355,7 +406,6 @@ namespace Jyx2
                     player.IQ = 50;
                     runtime.AllRoles[0] = player;
 
-                    // Add player to team
                     var teamField = typeof(GameRuntimeData).GetField("TeamId",
                         System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
                     if (teamField != null)
@@ -365,8 +415,6 @@ namespace Jyx2
                             teamList.Add(0);
                     }
 
-                    // Create stub roles for all IDs referenced in team_ids so
-                    // JoinRoleToTeam / GetRole won't return null in minimal mode
                     if (target.team_ids != null)
                     {
                         foreach (int roleId in target.team_ids)
@@ -409,7 +457,7 @@ namespace Jyx2
                 if (target.money > 0)
                 {
                     int moneyId = 10001;
-                    try { moneyId = GameConst.MONEY_ID; } catch { /* fallback to default */ }
+                    try { moneyId = GameConst.MONEY_ID; } catch { }
                     runtime.AddItem(moneyId, target.money);
                 }
 
@@ -425,8 +473,6 @@ namespace Jyx2
                             }
                             else
                             {
-                                // Minimal mode: ensure stub role exists, then add to
-                                // TeamId directly to avoid Lua-dependent item transfer
                                 if (!runtime.AllRoles.ContainsKey(roleId))
                                 {
                                     var stub = new RoleInstance();
@@ -628,7 +674,7 @@ namespace Jyx2
                             var itemConfig = LuaToCsBridge.ItemTable[action.item_id];
                             runtime.Player.UseItem(itemConfig);
                         }
-                        catch { /* Lua not initialized; skip UseItem effects */ }
+                        catch { }
                         runtime.AddItem(action.item_id, -1);
                         return new WarptestCheck
                         {
@@ -875,8 +921,6 @@ namespace Jyx2
         }
     }
 
-    #region WarpTest JSON Schema
-
     [Serializable]
     public class WarptestRequest
     {
@@ -984,6 +1028,4 @@ namespace Jyx2
         public string screenshot_path;
         public List<WarptestCheck> checks;
     }
-
-    #endregion
 }
