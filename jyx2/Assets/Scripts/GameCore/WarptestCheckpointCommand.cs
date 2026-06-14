@@ -17,6 +17,23 @@ namespace Jyx2
 {
     public static class WarptestCheckpoint
     {
+#if UNITY_EDITOR
+        const string PendingKey = "WarpTest.Jynew.Pending";
+        const string PendingRequestPathKey = "WarpTest.Jynew.PendingRequestPath";
+        const string PendingReportPathKey = "WarpTest.Jynew.PendingReportPath";
+        static int s_pendingPlayModeFrames;
+
+        [UnityEditor.InitializeOnLoadMethod]
+        static void ResumePendingPlayModeRun()
+        {
+            if (!UnityEditor.EditorPrefs.GetBool(PendingKey, false))
+                return;
+            s_pendingPlayModeFrames = 30;
+            UnityEditor.EditorApplication.update -= RunPendingWhenPlayModeReady;
+            UnityEditor.EditorApplication.update += RunPendingWhenPlayModeReady;
+        }
+#endif
+
         public static void Run()
         {
             string requestPath = null;
@@ -37,6 +54,16 @@ namespace Jyx2
                 return;
             }
 
+#if UNITY_EDITOR
+            if (MaybeQueuePlayModeRun(requestPath, reportPath))
+                return;
+#endif
+
+            ExecuteRequestPath(requestPath, reportPath);
+        }
+
+        static void ExecuteRequestPath(string requestPath, string reportPath)
+        {
             try
             {
                 var requestJson = File.ReadAllText(requestPath, Encoding.UTF8);
@@ -59,6 +86,53 @@ namespace Jyx2
                 EditorQuit(1);
             }
         }
+
+#if UNITY_EDITOR
+        static bool MaybeQueuePlayModeRun(string requestPath, string reportPath)
+        {
+            if (Application.isPlaying)
+                return false;
+
+            var requestJson = File.ReadAllText(requestPath, Encoding.UTF8);
+            var request = JsonUtility.FromJson<WarptestRequest>(requestJson);
+            if (request == null || string.IsNullOrEmpty(request.screenshot_output_path))
+                return false;
+
+            UnityEditor.EditorPrefs.SetBool(PendingKey, true);
+            UnityEditor.EditorPrefs.SetString(PendingRequestPathKey, requestPath);
+            UnityEditor.EditorPrefs.SetString(PendingReportPathKey, reportPath);
+            s_pendingPlayModeFrames = 30;
+            UnityEditor.EditorApplication.update -= RunPendingWhenPlayModeReady;
+            UnityEditor.EditorApplication.update += RunPendingWhenPlayModeReady;
+            UnityEditor.EditorApplication.isPlaying = true;
+            Debug.Log("[WarpTest] Queued screenshot run for Unity play mode.");
+            return true;
+        }
+
+        static void RunPendingWhenPlayModeReady()
+        {
+            if (!UnityEditor.EditorApplication.isPlaying)
+                return;
+            if (s_pendingPlayModeFrames-- > 0)
+                return;
+
+            UnityEditor.EditorApplication.update -= RunPendingWhenPlayModeReady;
+            var requestPath = UnityEditor.EditorPrefs.GetString(PendingRequestPathKey, "");
+            var reportPath = UnityEditor.EditorPrefs.GetString(PendingReportPathKey, "");
+            UnityEditor.EditorPrefs.DeleteKey(PendingKey);
+            UnityEditor.EditorPrefs.DeleteKey(PendingRequestPathKey);
+            UnityEditor.EditorPrefs.DeleteKey(PendingReportPathKey);
+
+            if (string.IsNullOrEmpty(requestPath) || string.IsNullOrEmpty(reportPath))
+            {
+                Debug.LogError("[WarpTest] Pending play-mode run lost request/report paths.");
+                EditorQuit(1);
+                return;
+            }
+
+            ExecuteRequestPath(requestPath, reportPath);
+        }
+#endif
 
         static WarptestReport ProcessRequest(WarptestRequest request)
         {
@@ -120,13 +194,72 @@ namespace Jyx2
                 checks.Add(CheckAssertion(assertion));
             }
 
+            if (!string.IsNullOrEmpty(request.screenshot_output_path))
+            {
+                try
+                {
+                    string screenshotDir = Path.GetDirectoryName(request.screenshot_output_path);
+                    if (!string.IsNullOrEmpty(screenshotDir) && !Directory.Exists(screenshotDir))
+                        Directory.CreateDirectory(screenshotDir);
+                    CaptureScreenshotToFile(request.screenshot_output_path);
+                    Debug.Log($"[WarpTest] Screenshot captured to {request.screenshot_output_path}");
+                }
+                catch (Exception e)
+                {
+                    Debug.LogWarning($"[WarpTest] Screenshot capture failed (non-fatal): {e.Message}");
+                }
+            }
+
             bool allOk = checks.All(c => c.status == "success");
             return new WarptestReport
             {
                 status = allOk ? "success" : "failure",
                 detail = allOk ? "All checks passed." : "One or more checks failed.",
+                screenshot_path = request.screenshot_output_path ?? "",
                 checks = checks
             };
+        }
+
+        static void CaptureScreenshotToFile(string outputPath)
+        {
+            if (Application.isPlaying)
+            {
+                var texture = ScreenCapture.CaptureScreenshotAsTexture();
+                File.WriteAllBytes(outputPath, texture.EncodeToPNG());
+                UnityEngine.Object.Destroy(texture);
+                return;
+            }
+
+            var camera = Camera.main ?? UnityEngine.Object.FindObjectOfType<Camera>();
+            if (camera == null)
+            {
+                throw new InvalidOperationException("No Unity camera is available for editor-mode screenshot capture.");
+            }
+
+            var width = Math.Max(640, Screen.width > 0 ? Screen.width : 1280);
+            var height = Math.Max(360, Screen.height > 0 ? Screen.height : 720);
+            var renderTexture = new RenderTexture(width, height, 24);
+            var previousTarget = camera.targetTexture;
+            var previousActive = RenderTexture.active;
+            try
+            {
+                camera.targetTexture = renderTexture;
+                RenderTexture.active = renderTexture;
+                camera.Render();
+
+                var texture = new Texture2D(width, height, TextureFormat.RGB24, false);
+                texture.ReadPixels(new Rect(0, 0, width, height), 0, 0);
+                texture.Apply();
+                File.WriteAllBytes(outputPath, texture.EncodeToPNG());
+                UnityEngine.Object.DestroyImmediate(texture);
+            }
+            finally
+            {
+                camera.targetTexture = previousTarget;
+                RenderTexture.active = previousActive;
+                renderTexture.Release();
+                UnityEngine.Object.DestroyImmediate(renderTexture);
+            }
         }
 
         static void EnsureStubRolesForSpec(WarptestSpec spec)
@@ -748,6 +881,7 @@ namespace Jyx2
     public class WarptestRequest
     {
         public string spec_path;
+        public string screenshot_output_path;
         public WarptestSpec spec;
     }
 
@@ -847,6 +981,7 @@ namespace Jyx2
     {
         public string status;
         public string detail;
+        public string screenshot_path;
         public List<WarptestCheck> checks;
     }
 
