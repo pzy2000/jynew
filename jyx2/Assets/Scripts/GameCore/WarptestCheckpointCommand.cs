@@ -11,6 +11,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Text;
+using Cysharp.Threading.Tasks;
 using UnityEngine;
 
 namespace Jyx2
@@ -64,6 +65,18 @@ namespace Jyx2
 
         static void ExecuteRequestPath(string requestPath, string reportPath)
         {
+#if UNITY_EDITOR
+            if (Application.isPlaying)
+            {
+                var requestJson = File.ReadAllText(requestPath, Encoding.UTF8);
+                var request = JsonUtility.FromJson<WarptestRequest>(requestJson);
+                if (request != null && !string.IsNullOrEmpty(request.screenshot_output_path))
+                {
+                    ExecuteRequestPathAsync(requestPath, reportPath).Forget();
+                    return;
+                }
+            }
+#endif
             try
             {
                 var requestJson = File.ReadAllText(requestPath, Encoding.UTF8);
@@ -88,6 +101,34 @@ namespace Jyx2
         }
 
 #if UNITY_EDITOR
+        static async UniTaskVoid ExecuteRequestPathAsync(string requestPath, string reportPath)
+        {
+            try
+            {
+                var requestJson = File.ReadAllText(requestPath, Encoding.UTF8);
+                var request = JsonUtility.FromJson<WarptestRequest>(requestJson);
+                var report = await ProcessRequestAsync(request);
+                File.WriteAllText(reportPath, JsonUtility.ToJson(report, true), Encoding.UTF8);
+                Debug.Log($"[WarpTest] Report written to {reportPath}");
+                EditorQuit(report.status == "success" ? 0 : 1);
+            }
+            catch (Exception e)
+            {
+                var errorReport = new WarptestReport
+                {
+                    status = "failure",
+                    detail = $"WarpTest exception: {e.Message}",
+                    screenshot_status = "failure",
+                    screenshot_source = "capture_failure",
+                    screenshot_detail = e.Message,
+                    checks = new List<WarptestCheck>()
+                };
+                File.WriteAllText(reportPath, JsonUtility.ToJson(errorReport, true), Encoding.UTF8);
+                Debug.LogError($"[WarpTest] {e}");
+                EditorQuit(1);
+            }
+        }
+
         static bool MaybeQueuePlayModeRun(string requestPath, string reportPath)
         {
             if (Application.isPlaying)
@@ -134,6 +175,59 @@ namespace Jyx2
         }
 #endif
 
+        static WarptestReport CaptureSkippedReport(WarptestRequest request, string status, string detail, List<WarptestCheck> checks)
+        {
+            return new WarptestReport
+            {
+                status = status,
+                detail = detail,
+                screenshot_path = request.screenshot_output_path ?? "",
+                screenshot_status = string.IsNullOrEmpty(request.screenshot_output_path) ? "skipped" : "failure",
+                screenshot_source = string.IsNullOrEmpty(request.screenshot_output_path) ? "" : "capture_failure",
+                screenshot_detail = "",
+                checks = checks
+            };
+        }
+
+#if UNITY_EDITOR
+        static async UniTask<WarptestReport> ProcessRequestAsync(WarptestRequest request)
+        {
+            string screenshotPath = request.screenshot_output_path;
+            request.screenshot_output_path = "";
+            await PrepareRuntimeForCapture(request.spec.target);
+            var report = ProcessRequest(request);
+            request.screenshot_output_path = screenshotPath;
+            report.screenshot_path = screenshotPath ?? "";
+
+            if (string.IsNullOrEmpty(screenshotPath) || report.status != "success")
+                return report;
+
+            try
+            {
+                string screenshotDir = Path.GetDirectoryName(screenshotPath);
+                if (!string.IsNullOrEmpty(screenshotDir) && !Directory.Exists(screenshotDir))
+                    Directory.CreateDirectory(screenshotDir);
+                string sceneDetail = await PrepareVisualSceneForCapture(request.spec.target);
+                string captureDetail = await CaptureScreenshotToFileWithRetries(screenshotPath);
+                report.screenshot_status = "success";
+                report.screenshot_source = "unity_capture";
+                report.screenshot_detail = $"{sceneDetail}; {captureDetail}";
+                Debug.Log($"[WarpTest] Screenshot captured to {screenshotPath}");
+            }
+            catch (Exception e)
+            {
+                if (File.Exists(screenshotPath))
+                    File.Delete(screenshotPath);
+                report.screenshot_status = "failure";
+                report.screenshot_source = "capture_failure";
+                report.screenshot_detail = e.Message;
+                Debug.LogWarning($"[WarpTest] Screenshot capture failed: {e.Message}");
+            }
+
+            return report;
+        }
+#endif
+
         static WarptestReport ProcessRequest(WarptestRequest request)
         {
             var checks = new List<WarptestCheck>();
@@ -163,7 +257,7 @@ namespace Jyx2
             bool restorationOk = checks.All(c => c.status == "success");
             if (!restorationOk)
             {
-                return new WarptestReport { status = "failure", detail = "Checkpoint restoration failed.", checks = checks };
+                return CaptureSkippedReport(request, "failure", "Checkpoint restoration failed.", checks);
             }
 
             EnsureStubRolesForSpec(spec);
@@ -183,6 +277,7 @@ namespace Jyx2
                 checks.Add(CheckAssertion(assertion));
             }
 
+            string screenshotFailureDetail = "";
             if (!string.IsNullOrEmpty(request.screenshot_output_path))
             {
                 try
@@ -190,11 +285,23 @@ namespace Jyx2
                     string screenshotDir = Path.GetDirectoryName(request.screenshot_output_path);
                     if (!string.IsNullOrEmpty(screenshotDir) && !Directory.Exists(screenshotDir))
                         Directory.CreateDirectory(screenshotDir);
-                    CaptureScreenshotToFile(request.screenshot_output_path);
+                    string captureDetail = CaptureScreenshotToFile(request.screenshot_output_path);
                     Debug.Log($"[WarpTest] Screenshot captured to {request.screenshot_output_path}");
+                    bool allChecksOk = checks.All(c => c.status == "success");
+                    return new WarptestReport
+                    {
+                        status = allChecksOk ? "success" : "failure",
+                        detail = allChecksOk ? "All checks passed." : "One or more checks failed.",
+                        screenshot_path = request.screenshot_output_path ?? "",
+                        screenshot_status = "success",
+                        screenshot_source = "unity_capture",
+                        screenshot_detail = captureDetail,
+                        checks = checks
+                    };
                 }
                 catch (Exception e)
                 {
+                    screenshotFailureDetail = e.Message;
                     Debug.LogWarning($"[WarpTest] Screenshot capture failed (non-fatal): {e.Message}");
                 }
             }
@@ -205,17 +312,20 @@ namespace Jyx2
                 status = allOk ? "success" : "failure",
                 detail = allOk ? "All checks passed." : "One or more checks failed.",
                 screenshot_path = request.screenshot_output_path ?? "",
+                screenshot_status = string.IsNullOrEmpty(request.screenshot_output_path) ? "skipped" : "failure",
+                screenshot_source = string.IsNullOrEmpty(request.screenshot_output_path) ? "" : "capture_failure",
+                screenshot_detail = screenshotFailureDetail,
                 checks = checks
             };
         }
 
-        static void CaptureScreenshotToFile(string outputPath)
+        static string CaptureScreenshotToFile(string outputPath)
         {
             string cameraDetail;
             if (TryCaptureCameraToFile(outputPath, out cameraDetail))
             {
                 Debug.Log("[WarpTest] Screenshot captured via camera render.");
-                return;
+                return cameraDetail;
             }
             Debug.LogWarning($"[WarpTest] Camera screenshot capture was not informative: {cameraDetail}");
 
@@ -230,7 +340,7 @@ namespace Jyx2
                         if (TextureHasVisibleRange(texture))
                         {
                             Debug.Log("[WarpTest] Screenshot captured via ScreenCapture.");
-                            return;
+                            return "ScreenCapture captured an informative image.";
                         }
                     }
                 }
@@ -245,6 +355,97 @@ namespace Jyx2
                 File.Delete(outputPath);
             throw new InvalidOperationException($"Unable to capture an informative Unity screenshot: {cameraDetail}");
         }
+
+#if UNITY_EDITOR
+        static async UniTask<string> PrepareVisualSceneForCapture(WarptestTarget target)
+        {
+            await PrepareRuntimeForCapture(target);
+
+            int mapId = target.map_id >= 0 ? target.map_id : GameConst.WORLD_MAP_ID;
+            var map = LuaToCsBridge.MapTable[mapId];
+            if (map == null)
+                throw new InvalidOperationException($"Unable to resolve jynew map for capture: {mapId}");
+
+            bool loaded = false;
+            Exception callbackError = null;
+            var loadPara = new LevelMaster.LevelLoadPara { loadType = LevelMaster.LevelLoadPara.LevelLoadType.Load };
+            LevelMaster.LastGameMap = null;
+            LevelLoader.LoadGameMap(map, loadPara, () =>
+            {
+                try
+                {
+                    LuaExecutor.Clear();
+                    if (LevelMaster.Instance != null)
+                        LevelMaster.Instance.TryBindPlayer().Forget();
+                }
+                catch (Exception e)
+                {
+                    callbackError = e;
+                }
+                loaded = true;
+            });
+
+            for (int frame = 0; frame < 300; frame++)
+            {
+                if (callbackError != null)
+                    throw callbackError;
+                if (loaded && LevelMaster.GetCurrentGameMap() != null && Camera.main != null)
+                {
+                    await UniTask.DelayFrame(10);
+                    return $"Loaded visual scene map_id={mapId}, scene={LevelMaster.GetCurrentGameMap().MapScene}";
+                }
+                await UniTask.DelayFrame(1);
+            }
+
+            throw new TimeoutException($"Timed out waiting for jynew visual scene map_id={mapId}");
+        }
+
+        static async UniTask PrepareRuntimeForCapture(WarptestTarget target)
+        {
+            string modId = string.IsNullOrEmpty(target.mod_id) ? GameConst.DEFAULT_GAME_MOD_NAME : target.mod_id;
+            if (RuntimeEnvSetup.GetCurrentMod() == null)
+                SelectEditorMod(modId);
+
+            await RuntimeEnvSetup.Setup();
+            if (GameRuntimeData.Instance == null)
+                GameRuntimeData.CreateNew();
+
+            if (target.map_id >= 0)
+                GameRuntimeData.Instance.SubMapData = new SubMapSaveData(target.map_id);
+        }
+
+        static void SelectEditorMod(string modId)
+        {
+            var mods = new Jyx2.MOD.ModV2.GameModEditorLoader().LoadModsSync();
+            foreach (var mod in mods)
+            {
+                if (mod.Id == modId)
+                {
+                    RuntimeEnvSetup.SetCurrentMod(mod);
+                    return;
+                }
+            }
+            throw new InvalidOperationException($"Unable to select editor mod for jynew capture: {modId}");
+        }
+
+        static async UniTask<string> CaptureScreenshotToFileWithRetries(string outputPath)
+        {
+            Exception last = null;
+            for (int attempt = 0; attempt < 90; attempt++)
+            {
+                try
+                {
+                    return CaptureScreenshotToFile(outputPath);
+                }
+                catch (Exception e)
+                {
+                    last = e;
+                    await UniTask.DelayFrame(2);
+                }
+            }
+            throw new InvalidOperationException($"Unable to capture an informative Unity screenshot after retries: {last?.Message}");
+        }
+#endif
 
         static bool TryCaptureCameraToFile(string outputPath, out string detail)
         {
@@ -1026,6 +1227,9 @@ namespace Jyx2
         public string status;
         public string detail;
         public string screenshot_path;
+        public string screenshot_status;
+        public string screenshot_source;
+        public string screenshot_detail;
         public List<WarptestCheck> checks;
     }
 }
