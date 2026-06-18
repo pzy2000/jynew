@@ -66,15 +66,12 @@ namespace Jyx2
         static void ExecuteRequestPath(string requestPath, string reportPath)
         {
 #if UNITY_EDITOR
-            if (Application.isPlaying)
+            var modeRequestJson = File.ReadAllText(requestPath, Encoding.UTF8);
+            var modeRequest = JsonUtility.FromJson<WarptestRequest>(modeRequestJson);
+            if (modeRequest != null && !string.IsNullOrEmpty(modeRequest.screenshot_output_path))
             {
-                var requestJson = File.ReadAllText(requestPath, Encoding.UTF8);
-                var request = JsonUtility.FromJson<WarptestRequest>(requestJson);
-                if (request != null && !string.IsNullOrEmpty(request.screenshot_output_path))
-                {
-                    ExecuteRequestPathAsync(requestPath, reportPath).Forget();
-                    return;
-                }
+                ExecuteRequestPathAsync(requestPath, reportPath).Forget();
+                return;
             }
 #endif
             try
@@ -132,6 +129,8 @@ namespace Jyx2
         static bool MaybeQueuePlayModeRun(string requestPath, string reportPath)
         {
             if (Application.isPlaying)
+                return false;
+            if (Application.isBatchMode)
                 return false;
 
             var requestJson = File.ReadAllText(requestPath, Encoding.UTF8);
