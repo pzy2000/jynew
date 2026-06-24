@@ -66,12 +66,15 @@ namespace Jyx2
         static void ExecuteRequestPath(string requestPath, string reportPath)
         {
 #if UNITY_EDITOR
-            var modeRequestJson = File.ReadAllText(requestPath, Encoding.UTF8);
-            var modeRequest = JsonUtility.FromJson<WarptestRequest>(modeRequestJson);
-            if (modeRequest != null && !string.IsNullOrEmpty(modeRequest.screenshot_output_path))
+            if (Application.isPlaying)
             {
-                ExecuteRequestPathAsync(requestPath, reportPath).Forget();
-                return;
+                var modeRequestJson = File.ReadAllText(requestPath, Encoding.UTF8);
+                var modeRequest = JsonUtility.FromJson<WarptestRequest>(modeRequestJson);
+                if (modeRequest != null && !string.IsNullOrEmpty(modeRequest.screenshot_output_path))
+                {
+                    ExecuteRequestPathAsync(requestPath, reportPath).Forget();
+                    return;
+                }
             }
 #endif
             try
