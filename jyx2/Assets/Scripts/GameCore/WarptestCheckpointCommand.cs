@@ -4,6 +4,11 @@
  * Test-gated utility for semantic checkpoint validation.
  * Activated only via Unity batch mode:
  * -executeMethod Jyx2.WarptestCheckpoint.Run
+ *
+ * A second entry point, -executeMethod Jyx2.WarptestCheckpoint.RunWarm, keeps a
+ * single Unity batch-mode process alive across many checkpoint requests (the C3
+ * state-fuzzing warm session). It reuses ProcessRequest() as-is; the only new
+ * behavior is the request/report/ready polling loop below.
  */
 
 using System;
@@ -11,6 +16,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Text;
+using System.Threading;
 using Cysharp.Threading.Tasks;
 using UnityEngine;
 
@@ -18,6 +24,11 @@ namespace Jyx2
 {
     public static class WarptestCheckpoint
     {
+        // Bump this if the warm request/report/ready JSON shape changes; the Python
+        // JynewWarmSession rejects a mismatched version as a protocol error rather
+        // than treating it as a game-level defect.
+        const string WarmSessionVersion = "jynew-c3-session-v1";
+
 #if UNITY_EDITOR
         const string PendingKey = "WarpTest.Jynew.Pending";
         const string PendingRequestPathKey = "WarpTest.Jynew.PendingRequestPath";
@@ -61,6 +72,172 @@ namespace Jyx2
 #endif
 
             ExecuteRequestPath(requestPath, reportPath);
+        }
+
+        /// <summary>
+        /// C3 warm-session entry point. Unlike Run(), this never exits on its own:
+        /// it polls for sequence-numbered requests and processes each one through the
+        /// existing synthesized_state path (no screenshot, no Play Mode), so a whole
+        /// fuzz task's candidates are injected against one already-warm process
+        /// instead of paying a fresh Unity boot per candidate. The parent Python
+        /// process owns lifecycle (kill on close()/restart()).
+        /// </summary>
+        public static void RunWarm()
+        {
+            string requestPath = null;
+            string reportPath = null;
+            string readyPath = null;
+            var args = Environment.GetCommandLineArgs();
+            for (int i = 0; i < args.Length; i++)
+            {
+                if (args[i] == "--warptest-warm-request" && i + 1 < args.Length)
+                    requestPath = args[i + 1];
+                if (args[i] == "--warptest-warm-report" && i + 1 < args.Length)
+                    reportPath = args[i + 1];
+                if (args[i] == "--warptest-warm-ready" && i + 1 < args.Length)
+                    readyPath = args[i + 1];
+            }
+
+            if (string.IsNullOrEmpty(requestPath) || string.IsNullOrEmpty(reportPath) || string.IsNullOrEmpty(readyPath))
+            {
+                Debug.LogError("[WarpTest] RunWarm requires --warptest-warm-request, --warptest-warm-report, and --warptest-warm-ready");
+                EditorQuit(1);
+                return;
+            }
+
+            try
+            {
+                RuntimeEnvSetup.Setup();
+            }
+            catch (Exception e)
+            {
+                Debug.LogWarning($"[WarpTest] Warm session runtime setup incomplete (non-fatal): {e.Message}");
+            }
+
+            RunWarmLoop(requestPath, reportPath, readyPath);
+        }
+
+        static void RunWarmLoop(string requestPath, string reportPath, string readyPath)
+        {
+            int lastSequence = 0;
+            WriteWarmReady(readyPath, 0);
+            Debug.Log("[WarpTest] Warm session ready (sequence=0).");
+
+            // Runs until the host process is killed (SIGTERM/SIGKILL from the
+            // Python-side session). There is deliberately no exit-on-request
+            // protocol field: lifecycle is owned by the parent, matching the
+            // OpenRA C3 warm session.
+            while (true)
+            {
+                WarptestWarmRequest request;
+                if (!TryReadWarmRequest(requestPath, out request) || request == null || request.sequence <= lastSequence)
+                {
+                    Thread.Sleep(50);
+                    continue;
+                }
+
+                int sequence = request.sequence;
+                WarptestWarmReport report = ProcessWarmRequest(request, sequence);
+                WriteWarmJson(reportPath, report);
+                lastSequence = sequence;
+                // GameRuntimeData.CreateNew() (inside SynthesizeState) always rebuilds a
+                // fresh runtime instance, so the next request already starts clean; no
+                // separate reset step is needed before signalling ready for sequence N.
+                WriteWarmReady(readyPath, sequence);
+                Debug.Log($"[WarpTest] Warm session processed sequence={sequence} status={report.status}");
+            }
+        }
+
+        static WarptestWarmReport ProcessWarmRequest(WarptestWarmRequest request, int sequence)
+        {
+            if (request.version != WarmSessionVersion)
+            {
+                return new WarptestWarmReport
+                {
+                    version = WarmSessionVersion,
+                    sequence = sequence,
+                    status = "rejected",
+                    detail = $"Unexpected warm protocol version: {request.version ?? "<missing>"}",
+                    checks = new List<WarptestCheck>(),
+                };
+            }
+            try
+            {
+                var innerRequest = new WarptestRequest
+                {
+                    spec_path = "<warm-session>",
+                    screenshot_output_path = "",
+                    spec = request.spec,
+                };
+                var inner = ProcessRequest(innerRequest);
+                // ProcessRequest already turns every expected failure mode (bad save
+                // index, synthesis exception, failed validation/action/assertion) into
+                // a "failure" status with per-check detail -- that is graceful handling
+                // of an adversarial candidate, not an engine defect. Only an exception
+                // that escapes ProcessRequest itself (caught below) is a genuine defect.
+                return new WarptestWarmReport
+                {
+                    version = WarmSessionVersion,
+                    sequence = sequence,
+                    status = inner.status == "success" ? "success" : "failure",
+                    detail = inner.detail,
+                    checks = inner.checks ?? new List<WarptestCheck>(),
+                };
+            }
+            catch (Exception e)
+            {
+                Debug.LogError($"[WarpTest] Warm session uncaught exception on sequence={sequence}: {e}");
+                return new WarptestWarmReport
+                {
+                    version = WarmSessionVersion,
+                    sequence = sequence,
+                    status = "engine_error",
+                    detail = $"Uncaught exception: {e.Message}",
+                    checks = new List<WarptestCheck>(),
+                };
+            }
+        }
+
+        static bool TryReadWarmRequest(string requestPath, out WarptestWarmRequest request)
+        {
+            request = null;
+            try
+            {
+                if (!File.Exists(requestPath))
+                    return false;
+                var json = File.ReadAllText(requestPath, Encoding.UTF8);
+                if (string.IsNullOrWhiteSpace(json))
+                    return false;
+                request = JsonUtility.FromJson<WarptestWarmRequest>(json);
+                return request != null;
+            }
+            catch (Exception)
+            {
+                // A request file mid-write (or transiently truncated by the Python
+                // atomic-replace) is not a protocol error: just retry next poll.
+                return false;
+            }
+        }
+
+        static void WriteWarmReady(string readyPath, int sequence)
+        {
+            WriteWarmJson(readyPath, new WarptestWarmReady
+            {
+                version = WarmSessionVersion,
+                sequence = sequence,
+                status = "ready",
+            });
+        }
+
+        static void WriteWarmJson(string path, object payload)
+        {
+            var json = JsonUtility.ToJson(payload);
+            var tempPath = path + ".tmp";
+            // UTF8Encoding(false): no BOM so Python json.loads("utf-8") works without utf-8-sig.
+            File.WriteAllText(tempPath, json, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
+            if (File.Exists(path))
+                File.Delete(path);
+            File.Move(tempPath, path);
         }
 
         static void ExecuteRequestPath(string requestPath, string reportPath)
@@ -1233,5 +1410,35 @@ namespace Jyx2
         public string screenshot_source;
         public string screenshot_detail;
         public List<WarptestCheck> checks;
+    }
+
+    // C3 warm-session protocol (RunWarm). Deliberately separate from
+    // WarptestRequest/WarptestReport above: the warm loop wraps the same
+    // WarptestSpec payload with a version + monotonic sequence number so the
+    // Python-side JynewWarmSession can detect stale/duplicate files under polling.
+    [Serializable]
+    public class WarptestWarmRequest
+    {
+        public string version;
+        public int sequence;
+        public WarptestSpec spec;
+    }
+
+    [Serializable]
+    public class WarptestWarmReport
+    {
+        public string version;
+        public int sequence;
+        public string status; // success | failure | rejected | engine_error
+        public string detail;
+        public List<WarptestCheck> checks;
+    }
+
+    [Serializable]
+    public class WarptestWarmReady
+    {
+        public string version;
+        public int sequence;
+        public string status; // always "ready"
     }
 }
