@@ -799,20 +799,33 @@ namespace Jyx2
 
         static string CaptureScreenshotToFile(string outputPath)
         {
-            if (Screen.width != 1280 || Screen.height != 720)
-                throw new InvalidOperationException($"GameView size drifted to {Screen.width}x{Screen.height}; expected 1280x720.");
             if (Application.isPlaying)
             {
-                var texture = ScreenCapture.CaptureScreenshotAsTexture();
+                var source = ScreenCapture.CaptureScreenshotAsTexture();
+                Texture2D texture = null;
                 try
                 {
-                    if (texture != null)
+                    if (source != null)
                     {
+                        texture = new Texture2D(1280, 720, TextureFormat.RGB24, false);
+                        var sourcePixels = source.GetPixels32();
+                        var normalizedPixels = new Color32[1280 * 720];
+                        for (int y = 0; y < 720; y++)
+                        {
+                            int sourceY = Math.Min(source.height - 1, y * source.height / 720);
+                            for (int x = 0; x < 1280; x++)
+                            {
+                                int sourceX = Math.Min(source.width - 1, x * source.width / 1280);
+                                normalizedPixels[y * 1280 + x] = sourcePixels[sourceY * source.width + sourceX];
+                            }
+                        }
+                        texture.SetPixels32(normalizedPixels);
+                        texture.Apply();
                         File.WriteAllBytes(outputPath, texture.EncodeToPNG());
                         if (TextureHasVisibleRange(texture))
                         {
                             Debug.Log("[WarpTest] Screenshot captured via ScreenCapture.");
-                            return "ScreenCapture captured final GameView pixels including overlay UI.";
+                            return $"ScreenCapture captured final GameView pixels including overlay UI and normalized {source.width}x{source.height} to 1280x720.";
                         }
                     }
                 }
@@ -820,9 +833,14 @@ namespace Jyx2
                 {
                     if (texture != null)
                         UnityEngine.Object.Destroy(texture);
+                    if (source != null)
+                        UnityEngine.Object.Destroy(source);
                 }
             }
 
+            string cameraDetail;
+            if (TryCaptureCameraToFile(outputPath, out cameraDetail))
+                return "Camera render captured final GameView pixels with Screen Space Overlay canvases at 1280x720. " + cameraDetail;
             if (File.Exists(outputPath))
                 File.Delete(outputPath);
             throw new InvalidOperationException("Unable to capture informative final GameView pixels.");
@@ -928,13 +946,25 @@ namespace Jyx2
                 return false;
             }
 
-            var width = Math.Max(640, Screen.width > 0 ? Screen.width : 1280);
-            var height = Math.Max(360, Screen.height > 0 ? Screen.height : 720);
+            const int width = 1280;
+            const int height = 720;
             var renderTexture = new RenderTexture(width, height, 24);
             var previousTarget = camera.targetTexture;
             var previousActive = RenderTexture.active;
+            var overlayCanvases = UnityEngine.Object.FindObjectsOfType<Canvas>()
+                .Where(canvas => canvas != null && canvas.renderMode == RenderMode.ScreenSpaceOverlay)
+                .ToArray();
+            var previousCameras = overlayCanvases.Select(canvas => canvas.worldCamera).ToArray();
+            var previousDistances = overlayCanvases.Select(canvas => canvas.planeDistance).ToArray();
             try
             {
+                foreach (var canvas in overlayCanvases)
+                {
+                    canvas.renderMode = RenderMode.ScreenSpaceCamera;
+                    canvas.worldCamera = camera;
+                    canvas.planeDistance = Math.Max(camera.nearClipPlane + 0.1f, 1f);
+                }
+                Canvas.ForceUpdateCanvases();
                 camera.targetTexture = renderTexture;
                 RenderTexture.active = renderTexture;
                 camera.Render();
@@ -950,6 +980,13 @@ namespace Jyx2
             }
             finally
             {
+                for (int index = 0; index < overlayCanvases.Length; index++)
+                {
+                    overlayCanvases[index].renderMode = RenderMode.ScreenSpaceOverlay;
+                    overlayCanvases[index].worldCamera = previousCameras[index];
+                    overlayCanvases[index].planeDistance = previousDistances[index];
+                }
+                Canvas.ForceUpdateCanvases();
                 camera.targetTexture = previousTarget;
                 RenderTexture.active = previousActive;
                 renderTexture.Release();
@@ -1644,7 +1681,11 @@ namespace Jyx2
         {
             if (x < 0 || x >= 1280 || y < 0 || y >= 720)
                 throw new InvalidOperationException($"Input coordinate ({x}, {y}) is outside 1280x720.");
-            return new Vector2(x, y);
+            if (Screen.width <= 0 || Screen.height <= 0)
+                throw new InvalidOperationException("GameView has no input surface.");
+            return new Vector2(
+                x * (Screen.width / 1280f),
+                y * (Screen.height / 720f));
         }
 
         static int QueueC1Action(WarptestC1InputAction action)
