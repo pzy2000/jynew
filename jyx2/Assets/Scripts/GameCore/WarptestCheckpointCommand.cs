@@ -33,7 +33,7 @@ namespace Jyx2
         // JynewWarmSession rejects a mismatched version as a protocol error rather
         // than treating it as a game-level defect.
         const string WarmSessionVersion = "jynew-c3-session-v1";
-        internal const string C1SessionVersion = "warptest-c1-unity-v2";
+        internal const string C1SessionVersion = "warptest-c1-unity-v3";
         const string StateEvidenceVersion = "warptest-unity-checkpoint-state-v1";
 
 #if UNITY_EDITOR
@@ -44,6 +44,7 @@ namespace Jyx2
         const string C1RequestPathKey = "WarpTest.Jynew.C1RequestPath";
         const string C1ReportPathKey = "WarpTest.Jynew.C1ReportPath";
         const string C1ReadyPathKey = "WarpTest.Jynew.C1ReadyPath";
+        const string C1SessionIdKey = "WarpTest.Jynew.C1SessionId";
         static int s_pendingPlayModeFrames;
         static int s_pendingC1PlayModeFrames;
         static bool s_c1TransitionRequired;
@@ -55,6 +56,19 @@ namespace Jyx2
         static int s_c1SaveFrame = -1;
         static int s_c1LoadFrame = -1;
         static GameRuntimeData s_c1RuntimeAtSave;
+        static int s_c1PolicyFrameId = -1;
+        static bool s_c1PolicyFrameConsumed = true;
+        static readonly Dictionary<string, WarptestC1Report> s_c1InputReceipts = new Dictionary<string, WarptestC1Report>();
+        static string s_c1SessionId = "";
+
+        internal static void ConfigureC1BackgroundSession(string sessionId)
+        {
+            s_c1SessionId = sessionId ?? "";
+            s_c1PolicyFrameId = -1;
+            s_c1PolicyFrameConsumed = true;
+            s_c1InputReceipts.Clear();
+            Application.runInBackground = true;
+        }
 
         internal static void ResetC1TransitionWitness()
         {
@@ -238,6 +252,7 @@ namespace Jyx2
             string requestPath = null;
             string reportPath = null;
             string readyPath = null;
+            string sessionId = null;
             var args = Environment.GetCommandLineArgs();
             for (int i = 0; i < args.Length; i++)
             {
@@ -247,9 +262,11 @@ namespace Jyx2
                     reportPath = args[i + 1];
                 if (args[i] == "--warptest-c1-ready" && i + 1 < args.Length)
                     readyPath = args[i + 1];
+                if (args[i] == "--warptest-c1-session" && i + 1 < args.Length)
+                    sessionId = args[i + 1];
             }
 
-            if (string.IsNullOrEmpty(requestPath) || string.IsNullOrEmpty(reportPath) || string.IsNullOrEmpty(readyPath))
+            if (string.IsNullOrEmpty(requestPath) || string.IsNullOrEmpty(reportPath) || string.IsNullOrEmpty(readyPath) || string.IsNullOrEmpty(sessionId))
             {
                 Debug.LogError("[WarpTest C1] Missing request/report/ready arguments.");
                 EditorQuit(1);
@@ -257,9 +274,9 @@ namespace Jyx2
             }
 
 #if UNITY_EDITOR
-            if (MaybeQueueC1PlayModeRun(requestPath, reportPath, readyPath))
+            if (MaybeQueueC1PlayModeRun(requestPath, reportPath, readyPath, sessionId))
                 return;
-            StartC1Runner(requestPath, reportPath, readyPath);
+            StartC1Runner(requestPath, reportPath, readyPath, sessionId);
 #else
             Debug.LogError("[WarpTest C1] Jynew C1 requires Unity editor play mode.");
             EditorQuit(1);
@@ -470,7 +487,7 @@ namespace Jyx2
         }
 
 #if UNITY_EDITOR
-        static bool MaybeQueueC1PlayModeRun(string requestPath, string reportPath, string readyPath)
+        static bool MaybeQueueC1PlayModeRun(string requestPath, string reportPath, string readyPath, string sessionId)
         {
             if (Application.isPlaying)
                 return false;
@@ -490,6 +507,7 @@ namespace Jyx2
             UnityEditor.EditorPrefs.SetString(C1RequestPathKey, requestPath);
             UnityEditor.EditorPrefs.SetString(C1ReportPathKey, reportPath);
             UnityEditor.EditorPrefs.SetString(C1ReadyPathKey, readyPath);
+            UnityEditor.EditorPrefs.SetString(C1SessionIdKey, sessionId);
             s_pendingC1PlayModeFrames = 30;
             UnityEditor.EditorApplication.update -= RunPendingC1WhenPlayModeReady;
             UnityEditor.EditorApplication.update += RunPendingC1WhenPlayModeReady;
@@ -509,38 +527,25 @@ namespace Jyx2
             var requestPath = UnityEditor.EditorPrefs.GetString(C1RequestPathKey, "");
             var reportPath = UnityEditor.EditorPrefs.GetString(C1ReportPathKey, "");
             var readyPath = UnityEditor.EditorPrefs.GetString(C1ReadyPathKey, "");
+            var sessionId = UnityEditor.EditorPrefs.GetString(C1SessionIdKey, "");
             UnityEditor.EditorPrefs.DeleteKey(C1PendingKey);
             UnityEditor.EditorPrefs.DeleteKey(C1RequestPathKey);
             UnityEditor.EditorPrefs.DeleteKey(C1ReportPathKey);
             UnityEditor.EditorPrefs.DeleteKey(C1ReadyPathKey);
+            UnityEditor.EditorPrefs.DeleteKey(C1SessionIdKey);
 
-            if (string.IsNullOrEmpty(requestPath) || string.IsNullOrEmpty(reportPath) || string.IsNullOrEmpty(readyPath))
+            if (string.IsNullOrEmpty(requestPath) || string.IsNullOrEmpty(reportPath) || string.IsNullOrEmpty(readyPath) || string.IsNullOrEmpty(sessionId))
             {
                 Debug.LogError("[WarpTest C1] Pending session lost IPC paths.");
                 EditorQuit(1);
                 return;
             }
-            StartC1Runner(requestPath, reportPath, readyPath);
-        }
-
-        static void FocusAndMaximizeGameView()
-        {
-            try
-            {
-                var gameViewType = typeof(UnityEditor.EditorWindow).Assembly.GetType("UnityEditor.GameView");
-                var gameView = UnityEditor.EditorWindow.GetWindow(gameViewType);
-                gameView.maximized = true;
-                gameView.Focus();
-            }
-            catch (Exception e)
-            {
-                Debug.LogWarning($"[WarpTest C1] Unable to maximize Game view: {e.Message}");
-            }
+            StartC1Runner(requestPath, reportPath, readyPath, sessionId);
         }
 #endif
 
 #if UNITY_EDITOR
-        static void StartC1Runner(string requestPath, string reportPath, string readyPath)
+        static void StartC1Runner(string requestPath, string reportPath, string readyPath, string sessionId)
         {
             var existing = UnityEngine.Object.FindObjectOfType<WarptestC1RunnerBehaviour>();
             if (existing != null)
@@ -548,8 +553,7 @@ namespace Jyx2
             var host = new GameObject("WarptestC1Runner");
             UnityEngine.Object.DontDestroyOnLoad(host);
             var runner = host.AddComponent<WarptestC1RunnerBehaviour>();
-            runner.Begin(requestPath, reportPath, readyPath);
-            FocusAndMaximizeGameView();
+            runner.Begin(requestPath, reportPath, readyPath, sessionId);
         }
 #endif
 
@@ -795,14 +799,8 @@ namespace Jyx2
 
         static string CaptureScreenshotToFile(string outputPath)
         {
-            string cameraDetail;
-            if (TryCaptureCameraToFile(outputPath, out cameraDetail))
-            {
-                Debug.Log("[WarpTest] Screenshot captured via camera render.");
-                return cameraDetail;
-            }
-            Debug.LogWarning($"[WarpTest] Camera screenshot capture was not informative: {cameraDetail}");
-
+            if (Screen.width != 1280 || Screen.height != 720)
+                throw new InvalidOperationException($"GameView size drifted to {Screen.width}x{Screen.height}; expected 1280x720.");
             if (Application.isPlaying)
             {
                 var texture = ScreenCapture.CaptureScreenshotAsTexture();
@@ -814,7 +812,7 @@ namespace Jyx2
                         if (TextureHasVisibleRange(texture))
                         {
                             Debug.Log("[WarpTest] Screenshot captured via ScreenCapture.");
-                            return "ScreenCapture captured an informative image.";
+                            return "ScreenCapture captured final GameView pixels including overlay UI.";
                         }
                     }
                 }
@@ -827,7 +825,7 @@ namespace Jyx2
 
             if (File.Exists(outputPath))
                 File.Delete(outputPath);
-            throw new InvalidOperationException($"Unable to capture an informative Unity screenshot: {cameraDetail}");
+            throw new InvalidOperationException("Unable to capture informative final GameView pixels.");
         }
 
 #if UNITY_EDITOR
@@ -1587,6 +1585,128 @@ namespace Jyx2
         }
 
 #if UNITY_EDITOR
+        static EventModifiers C1Modifiers(string[] names)
+        {
+            EventModifiers result = EventModifiers.None;
+            foreach (var raw in names ?? Array.Empty<string>())
+            {
+                switch ((raw ?? "").ToLowerInvariant())
+                {
+                    case "shift": result |= EventModifiers.Shift; break;
+                    case "ctrl": case "control": result |= EventModifiers.Control; break;
+                    case "alt": case "option": result |= EventModifiers.Alt; break;
+                    case "meta": case "command": case "cmd": result |= EventModifiers.Command; break;
+                    default: throw new InvalidOperationException($"Unsupported modifier: {raw}");
+                }
+            }
+            return result;
+        }
+
+        static KeyCode C1KeyCode(string raw)
+        {
+            switch ((raw ?? "").ToLowerInvariant())
+            {
+                case "enter": case "return": return KeyCode.Return;
+                case "escape": case "esc": return KeyCode.Escape;
+                case "backspace": return KeyCode.Backspace;
+                case "delete": return KeyCode.Delete;
+                case "tab": return KeyCode.Tab;
+                case "space": return KeyCode.Space;
+                case "left": return KeyCode.LeftArrow;
+                case "right": return KeyCode.RightArrow;
+                case "up": return KeyCode.UpArrow;
+                case "down": return KeyCode.DownArrow;
+                case "home": return KeyCode.Home;
+                case "end": return KeyCode.End;
+                case "pageup": return KeyCode.PageUp;
+                case "pagedown": return KeyCode.PageDown;
+            }
+            KeyCode parsed;
+            if (Enum.TryParse(raw, true, out parsed)) return parsed;
+            throw new InvalidOperationException($"Unsupported key: {raw}");
+        }
+
+        static void QueueC1Event(Event value)
+        {
+            UnityEditor.EditorGUIUtility.QueueGameViewInputEvent(value);
+        }
+
+        static int QueueC1Key(string key, string[] modifiers, char character = '\0')
+        {
+            var flags = C1Modifiers(modifiers);
+            var code = character == '\0' ? C1KeyCode(key) : KeyCode.None;
+            QueueC1Event(new Event { type = EventType.KeyDown, keyCode = code, character = character, modifiers = flags });
+            QueueC1Event(new Event { type = EventType.KeyUp, keyCode = code, character = '\0', modifiers = flags });
+            return 2;
+        }
+
+        static Vector2 C1Point(int x, int y)
+        {
+            if (x < 0 || x >= 1280 || y < 0 || y >= 720)
+                throw new InvalidOperationException($"Input coordinate ({x}, {y}) is outside 1280x720.");
+            return new Vector2(x, y);
+        }
+
+        static int QueueC1Action(WarptestC1InputAction action)
+        {
+            if (action == null) throw new InvalidOperationException("Input action is null.");
+            switch (action.kind)
+            {
+                case "done": case "fail": case "wait":
+                    if (action.seconds < 0 || action.seconds > 5) throw new InvalidOperationException("Wait duration is outside 0..5 seconds.");
+                    return 0;
+                case "click":
+                {
+                    int button = action.button == "right" ? 1 : action.button == "middle" ? 2 : 0;
+                    int clicks = action.clicks == 0 ? 1 : action.clicks;
+                    if (clicks < 1 || clicks > 3) throw new InvalidOperationException("Click count is outside 1..3.");
+                    var point = C1Point(action.x, action.y);
+                    var flags = C1Modifiers(action.modifiers);
+                    for (int i = 0; i < clicks; i++)
+                    {
+                        QueueC1Event(new Event { type = EventType.MouseDown, mousePosition = point, button = button, clickCount = clicks, modifiers = flags });
+                        QueueC1Event(new Event { type = EventType.MouseUp, mousePosition = point, button = button, clickCount = clicks, modifiers = flags });
+                    }
+                    return 2 * clicks;
+                }
+                case "key": return QueueC1Key(action.key, action.modifiers);
+                case "type":
+                {
+                    int count = 0;
+                    if (action.has_point)
+                        count += QueueC1Action(new WarptestC1InputAction { kind = "click", x = action.x, y = action.y, clicks = 1, button = "left" });
+                    if (action.overwrite)
+                    {
+                        count += QueueC1Key("a", new[] { "command" });
+                        count += QueueC1Key("backspace", Array.Empty<string>());
+                    }
+                    string text = action.text ?? "";
+                    if (text.Length > 4096) throw new InvalidOperationException("Input text exceeds 4096 characters.");
+                    foreach (char character in text) count += QueueC1Key("", Array.Empty<string>(), character);
+                    if (action.enter) count += QueueC1Key("enter", Array.Empty<string>());
+                    return count;
+                }
+                case "scroll":
+                    QueueC1Event(new Event { type = EventType.ScrollWheel, mousePosition = C1Point(action.x, action.y), delta = new Vector2(action.dx, action.dy) });
+                    return 1;
+                case "drag":
+                {
+                    if (action.duration < 0 || action.duration > 5) throw new InvalidOperationException("Drag duration is outside 0..5 seconds.");
+                    int button = action.button == "right" ? 1 : action.button == "middle" ? 2 : 0;
+                    var start = C1Point(action.x, action.y);
+                    var end = C1Point(action.x2, action.y2);
+                    var flags = C1Modifiers(action.modifiers);
+                    QueueC1Event(new Event { type = EventType.MouseDown, mousePosition = start, button = button, modifiers = flags });
+                    const int steps = 6;
+                    for (int i = 1; i <= steps; i++)
+                        QueueC1Event(new Event { type = EventType.MouseDrag, mousePosition = Vector2.Lerp(start, end, i / (float)steps), button = button, modifiers = flags });
+                    QueueC1Event(new Event { type = EventType.MouseUp, mousePosition = end, button = button, modifiers = flags });
+                    return steps + 2;
+                }
+                default: throw new InvalidOperationException($"Unsupported input action: {action.kind}");
+            }
+        }
+
         internal static async UniTask<WarptestC1Report> ProcessC1RequestAsync(WarptestC1Request request)
         {
             var checks = new List<WarptestCheck>();
@@ -1608,6 +1728,12 @@ namespace Jyx2
             {
                 report.status = "rejected";
                 report.detail = "Unexpected or missing C1 protocol version.";
+                return report;
+            }
+            if (string.IsNullOrEmpty(s_c1SessionId) || request.session_id != s_c1SessionId)
+            {
+                report.status = "rejected";
+                report.detail = "C1 session nonce mismatch.";
                 return report;
             }
             if (request.spec == null)
@@ -1696,15 +1822,46 @@ namespace Jyx2
                         if (!string.IsNullOrEmpty(directory)) Directory.CreateDirectory(directory);
                         await UniTask.DelayFrame(5);
                         string detail = await CaptureScreenshotToFileWithRetries(request.screenshot_output_path);
+                        s_c1PolicyFrameId++;
+                        s_c1PolicyFrameConsumed = false;
                         report.screenshot_status = "success";
-                        report.screenshot_source = "unity_capture";
+                        report.screenshot_source = "unity_gameview_capture";
                         report.screenshot_detail = detail;
+                        report.frame_id = s_c1PolicyFrameId;
+                        report.frame_width = 1280;
+                        report.frame_height = 720;
                         checks.Add(new WarptestCheck
                         {
                             name = "c1.live_capture",
                             status = "success",
                             detail = detail,
                         });
+                        break;
+                    }
+                    case "input_batch":
+                    {
+                        WarptestC1Report cached;
+                        if (!string.IsNullOrEmpty(request.batch_id) && s_c1InputReceipts.TryGetValue(request.batch_id, out cached))
+                        {
+                            cached.sequence = request.sequence;
+                            cached.operation = request.operation;
+                            return cached;
+                        }
+                        if (string.IsNullOrEmpty(request.batch_id) || request.frame_id != s_c1PolicyFrameId || s_c1PolicyFrameConsumed)
+                            throw new InvalidOperationException("Input batch references a stale or consumed frame.");
+                        if (request.actions == null || request.actions.Count < 1 || request.actions.Count > 64)
+                            throw new InvalidOperationException("Input batch action count is outside 1..64.");
+                        int eventCount = 0;
+                        foreach (var action in request.actions) eventCount += QueueC1Action(action);
+                        s_c1PolicyFrameConsumed = true;
+                        report.accepted = true;
+                        report.batch_id = request.batch_id;
+                        report.event_count = eventCount;
+                        report.resulting_frame_id = request.frame_id + 1;
+                        report.input_backend = "unity_editor_queue_gameview_input_v1";
+                        report.error = "";
+                        checks.Add(new WarptestCheck { name = "c1.input_batch", status = "success", detail = $"Queued {eventCount} GameView events." });
+                        s_c1InputReceipts[request.batch_id] = report;
                         break;
                     }
                     case "close":
@@ -1819,7 +1976,7 @@ namespace Jyx2
         int _lastSequence;
         bool _busy;
 
-        public void Begin(string requestPath, string reportPath, string readyPath)
+        public void Begin(string requestPath, string reportPath, string readyPath, string sessionId)
         {
             _requestPath = requestPath;
             _reportPath = reportPath;
@@ -1827,12 +1984,14 @@ namespace Jyx2
             Application.logMessageReceived -= WarptestCheckpoint.ObserveC1Log;
             Application.logMessageReceived += WarptestCheckpoint.ObserveC1Log;
             WarptestCheckpoint.ResetC1TransitionWitness();
+            WarptestCheckpoint.ConfigureC1BackgroundSession(sessionId);
             WarptestCheckpoint.WriteC1Json(readyPath, new WarptestC1Ready
             {
                 version = WarptestCheckpoint.C1SessionVersion,
                 sequence = 0,
                 status = "ready",
                 pid = System.Diagnostics.Process.GetCurrentProcess().Id,
+                session_id = sessionId,
             });
             Debug.Log("[WarpTest C1] Jynew persistent session ready.");
         }
@@ -1902,8 +2061,12 @@ namespace Jyx2
         public string version;
         public int sequence;
         public string operation;
+        public string session_id;
         public string spec_path;
         public string screenshot_output_path;
+        public int frame_id = -1;
+        public string batch_id;
+        public List<WarptestC1InputAction> actions = new List<WarptestC1InputAction>();
         public WarptestSpec spec;
         public WarptestC1TransitionExpectation transition_expectation;
     }
@@ -1920,6 +2083,15 @@ namespace Jyx2
         public string screenshot_status;
         public string screenshot_source;
         public string screenshot_detail;
+        public int frame_id = -1;
+        public int frame_width;
+        public int frame_height;
+        public string batch_id;
+        public bool accepted;
+        public int event_count;
+        public int resulting_frame_id = -1;
+        public string error;
+        public string input_backend;
         public WarptestC1TransitionEvidence transition_evidence;
         public List<WarptestCheck> checks = new List<WarptestCheck>();
     }
@@ -1954,6 +2126,29 @@ namespace Jyx2
         public int sequence;
         public string status;
         public int pid;
+        public string session_id;
+    }
+
+    [Serializable]
+    public class WarptestC1InputAction
+    {
+        public string kind;
+        public int x;
+        public int y;
+        public int x2;
+        public int y2;
+        public bool has_point;
+        public string key;
+        public string[] modifiers = Array.Empty<string>();
+        public string text;
+        public int dx;
+        public int dy;
+        public float seconds;
+        public float duration;
+        public string button;
+        public int clicks;
+        public bool overwrite;
+        public bool enter;
     }
 
     [Serializable]
