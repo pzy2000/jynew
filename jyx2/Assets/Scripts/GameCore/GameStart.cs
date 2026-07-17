@@ -116,6 +116,15 @@ public class GameStart : MonoBehaviour
 
 		Application.logMessageReceived += OnErrorMsg;
 
+		// The nonce-scoped C1 runner owns scene transitions for the duration of a
+		// formal background-pixel session.  Do not let the normal delayed splash
+		// route dispose its Lua environment underneath that persistent session.
+		if (WarptestCheckpoint.C1SessionActive)
+		{
+			Debug.Log("[WarpTest C1] Suppressed normal startup scene routing.");
+			return;
+		}
+
 		ModPanelNew.SwitchSceneTo();
 	}
 

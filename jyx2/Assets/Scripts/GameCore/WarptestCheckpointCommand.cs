@@ -20,6 +20,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
 using Cysharp.Threading.Tasks;
@@ -35,6 +36,18 @@ namespace Jyx2
         const string WarmSessionVersion = "jynew-c3-session-v1";
         internal const string C1SessionVersion = "warptest-c1-unity-v3";
         const string StateEvidenceVersion = "warptest-unity-checkpoint-state-v1";
+
+        public static bool C1SessionActive
+        {
+            get
+            {
+#if UNITY_EDITOR
+                return !string.IsNullOrEmpty(s_c1SessionId);
+#else
+                return false;
+#endif
+            }
+        }
 
 #if UNITY_EDITOR
         const string PendingKey = "WarpTest.Jynew.Pending";
@@ -61,8 +74,41 @@ namespace Jyx2
         static readonly Dictionary<string, WarptestC1Report> s_c1InputReceipts = new Dictionary<string, WarptestC1Report>();
         static string s_c1SessionId = "";
 
+#if UNITY_EDITOR_OSX
+        const string ObjectiveCLibrary = "/usr/lib/libobjc.A.dylib";
+        [DllImport(ObjectiveCLibrary)] static extern IntPtr objc_getClass(string name);
+        [DllImport(ObjectiveCLibrary)] static extern IntPtr sel_registerName(string name);
+        [DllImport(ObjectiveCLibrary, EntryPoint = "objc_msgSend")]
+        static extern IntPtr ObjcMessage(IntPtr receiver, IntPtr selector);
+        [DllImport(ObjectiveCLibrary, EntryPoint = "objc_msgSend")]
+        static extern bool ObjcMessageInteger(IntPtr receiver, IntPtr selector, long value);
+        [DllImport(ObjectiveCLibrary, EntryPoint = "objc_msgSend")]
+        static extern void ObjcMessageVoid(IntPtr receiver, IntPtr selector);
+#endif
+
+        internal static void EnforceC1BackgroundActivationPolicy()
+        {
+#if UNITY_EDITOR_OSX
+            try
+            {
+                IntPtr application = ObjcMessage(
+                    objc_getClass("NSApplication"), sel_registerName("sharedApplication"));
+                // NSApplicationActivationPolicyAccessory keeps the headed editor
+                // renderable without allowing it to displace the user's front app.
+                ObjcMessageInteger(application, sel_registerName("setActivationPolicy:"), 1);
+                ObjcMessageVoid(application, sel_registerName("deactivate"));
+            }
+            catch (Exception e)
+            {
+                Debug.LogError($"[WarpTest C1] Unable to enforce background activation policy: {e.Message}");
+                throw;
+            }
+#endif
+        }
+
         internal static void ConfigureC1BackgroundSession(string sessionId)
         {
+            EnforceC1BackgroundActivationPolicy();
             s_c1SessionId = sessionId ?? "";
             s_c1PolicyFrameId = -1;
             s_c1PolicyFrameConsumed = true;
@@ -249,6 +295,7 @@ namespace Jyx2
         /// </summary>
         public static void RunC1()
         {
+            EnforceC1BackgroundActivationPolicy();
             string requestPath = null;
             string reportPath = null;
             string readyPath = null;
@@ -2039,6 +2086,7 @@ namespace Jyx2
 
         void Update()
         {
+            WarptestCheckpoint.EnforceC1BackgroundActivationPolicy();
             WarptestCheckpoint.ObserveC1Transition();
             if (!_busy)
                 PollOnce().Forget();
