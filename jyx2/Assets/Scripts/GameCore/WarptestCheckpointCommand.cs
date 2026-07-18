@@ -944,11 +944,26 @@ namespace Jyx2
                 SelectEditorMod(modId);
 
             await RuntimeEnvSetup.Setup();
+            EnsureCheckpointMapContext(target);
             if (GameRuntimeData.Instance == null)
                 GameRuntimeData.CreateNew();
 
             if (target.map_id >= 0)
                 GameRuntimeData.Instance.SubMapData = new SubMapSaveData(target.map_id);
+        }
+
+        static void EnsureCheckpointMapContext(WarptestTarget target)
+        {
+            if (LevelMaster.GetCurrentGameMap() != null)
+                return;
+
+            int mapId = target != null && target.map_id >= 0
+                ? target.map_id
+                : GameConst.WORLD_MAP_ID;
+            var map = LuaToCsBridge.MapTable[mapId];
+            if (map == null)
+                throw new InvalidOperationException($"Unable to resolve jynew checkpoint map: {mapId}");
+            LevelMaster.SetCurrentMap(map);
         }
 
         static void SelectEditorMod(string modId)
