@@ -2003,7 +2003,16 @@ namespace Jyx2
         static List<WarptestCheck> CheckC1Target(WarptestTarget target)
         {
             var checks = new List<WarptestCheck>();
-            var runtime = GameRuntimeData.Instance;
+            // GameRuntimeData.Instance lazily calls CreateNew().  While the public
+            // UI is still on the mod-selection screen that constructor depends on
+            // gameplay-only tables and may throw instead of reporting a normal
+            // wrong-start result.  Semantic probes must be read-only, so inspect
+            // the already-existing singleton without creating one.
+            var runtimeField = typeof(GameRuntimeData).GetField(
+                "_instance",
+                System.Reflection.BindingFlags.NonPublic |
+                System.Reflection.BindingFlags.Static);
+            var runtime = runtimeField?.GetValue(null) as GameRuntimeData;
             if (runtime == null || runtime.Player == null)
             {
                 checks.Add(Fail("c1.target.runtime", "Jynew runtime/player is not live."));
