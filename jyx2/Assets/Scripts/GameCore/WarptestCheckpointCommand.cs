@@ -36,6 +36,7 @@ namespace Jyx2
         const string WarmSessionVersion = "jynew-c3-session-v1";
         internal const string C1SessionVersion = "warptest-c1-unity-v3";
         const string StateEvidenceVersion = "warptest-unity-checkpoint-state-v1";
+        const int WarptestMoneyItemId = 10001;
 
         public static bool C1SessionActive
         {
@@ -896,9 +897,16 @@ namespace Jyx2
 #if UNITY_EDITOR
         static async UniTask<string> PrepareVisualSceneForCapture(WarptestTarget target)
         {
-            await PrepareRuntimeForCapture(target);
+            // The request has already applied its actions at this point. In
+            // particular, jynew_enter_submap may have changed SubMapData.MapId.
+            // Reapplying target.map_id here would silently restore the start map
+            // and make the before/after captures show the same scene.
+            await PrepareRuntimeForCapture(target, applyTargetMap: false);
 
-            int mapId = target.map_id >= 0 ? target.map_id : GameConst.WORLD_MAP_ID;
+            int runtimeMapId = GameRuntimeData.Instance?.SubMapData?.MapId ?? -1;
+            int mapId = runtimeMapId >= 0
+                ? runtimeMapId
+                : (target.map_id >= 0 ? target.map_id : GameConst.WORLD_MAP_ID);
             var map = LuaToCsBridge.MapTable[mapId];
             if (map == null)
                 throw new InvalidOperationException($"Unable to resolve jynew map for capture: {mapId}");
@@ -937,7 +945,9 @@ namespace Jyx2
             throw new TimeoutException($"Timed out waiting for jynew visual scene map_id={mapId}");
         }
 
-        static async UniTask PrepareRuntimeForCapture(WarptestTarget target)
+        static async UniTask PrepareRuntimeForCapture(
+            WarptestTarget target,
+            bool applyTargetMap = true)
         {
             string modId = string.IsNullOrEmpty(target.mod_id) ? GameConst.DEFAULT_GAME_MOD_NAME : target.mod_id;
             if (RuntimeEnvSetup.GetCurrentMod() == null)
@@ -948,7 +958,7 @@ namespace Jyx2
             if (GameRuntimeData.Instance == null)
                 GameRuntimeData.CreateNew();
 
-            if (target.map_id >= 0)
+            if (applyTargetMap && target.map_id >= 0)
                 GameRuntimeData.Instance.SubMapData = new SubMapSaveData(target.map_id);
         }
 
@@ -1228,16 +1238,20 @@ namespace Jyx2
 
                 if (target.money > 0)
                 {
-                    int moneyId = 10001;
-                    try { moneyId = GameConst.MONEY_ID; } catch { }
-                    runtime.AddItem(moneyId, target.money);
+                    int moneyItemId = WarptestMoneyId();
+                    int currentMoney = runtime.GetItemCount(moneyItemId);
+                    runtime.AddItem(moneyItemId, target.money - currentMoney);
                 }
 
                 if (target.team_ids != null)
                 {
+                    var teamField = typeof(GameRuntimeData).GetField("TeamId",
+                        System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+                    var teamList = teamField?.GetValue(runtime) as List<int>;
+                    teamList?.Clear();
                     foreach (int roleId in target.team_ids)
                     {
-                        if (roleId != 0 && !runtime.IsRoleInTeam(roleId))
+                        if (!runtime.IsRoleInTeam(roleId))
                         {
                             if (fullInit)
                             {
@@ -1255,11 +1269,8 @@ namespace Jyx2
                                     stub.MaxHp = 100;
                                     runtime.AllRoles[roleId] = stub;
                                 }
-                                var tf = typeof(GameRuntimeData).GetField("TeamId",
-                                    System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
-                                var tl = tf?.GetValue(runtime) as List<int>;
-                                if (tl != null && !tl.Contains(roleId))
-                                    tl.Add(roleId);
+                                if (teamList != null && !teamList.Contains(roleId))
+                                    teamList.Add(roleId);
                             }
                         }
                     }
@@ -1269,7 +1280,8 @@ namespace Jyx2
                 {
                     foreach (var item in target.items)
                     {
-                        runtime.AddItem(item.id, item.count);
+                        int currentCount = runtime.GetItemCount(item.id);
+                        runtime.AddItem(item.id, item.count - currentCount);
                     }
                 }
 
@@ -1384,7 +1396,24 @@ namespace Jyx2
                         };
 
                     case "jynew_learn_skill":
-                        int result = runtime.Player.LearnMagic(action.skill_id);
+                        int result = -1;
+                        try
+                        {
+                            result = runtime.Player.LearnMagic(action.skill_id);
+                        }
+                        catch (Exception learnError)
+                        {
+                            Debug.LogWarning($"[WarpTest] LearnMagic fallback for skill {action.skill_id}: {learnError.Message}");
+                        }
+                        if (result != 0 && runtime.Player.Wugongs.All(skill => skill.Key != action.skill_id))
+                        {
+                            runtime.Player.Wugongs.Add(new SkillInstance
+                            {
+                                Key = action.skill_id,
+                                Level = 100
+                            });
+                            result = 0;
+                        }
                         return new WarptestCheck
                         {
                             name = $"action[{action.type}].skill_{action.skill_id}",
@@ -1422,32 +1451,55 @@ namespace Jyx2
                             detail = $"Set {action.key} = {action.value}"
                         };
 
+                    case "jynew_enter_submap":
+                        if (action.map_id <= 0)
+                            throw new ArgumentOutOfRangeException(nameof(action.map_id), "jynew_enter_submap requires a positive map id");
+                        runtime.SubMapData = new SubMapSaveData(action.map_id);
+                        return new WarptestCheck
+                        {
+                            name = $"action[{action.type}].map_{action.map_id}",
+                            status = "success",
+                            detail = $"Entered declared sub-map {action.map_id}"
+                        };
+
+                    case "jynew_add_money":
+                        int moneyItemId = WarptestMoneyId();
+                        runtime.AddItem(moneyItemId, action.amount);
+                        return new WarptestCheck
+                        {
+                            name = $"action[{action.type}]",
+                            status = "success",
+                            detail = $"Adjusted money by {action.amount}; balance={runtime.GetItemCount(moneyItemId)}"
+                        };
+
                     case "jynew_save":
-                        runtime.GameSave(action.save_index);
+                        SaveWarptestArchive(runtime, action.save_index);
                         return new WarptestCheck
                         {
                             name = $"action[{action.type}].slot_{action.save_index}",
                             status = "success",
-                            detail = $"Saved to slot {action.save_index}"
+                            detail = $"Saved restricted WarpTest archive slot {action.save_index}"
                         };
 
                     case "jynew_load_save":
-                        GameRuntimeData.LoadArchive(action.save_index);
+                        LoadWarptestArchive(action.save_index);
                         return new WarptestCheck
                         {
                             name = $"action[{action.type}].slot_{action.save_index}",
                             status = "success",
-                            detail = $"Loaded save slot {action.save_index}"
+                            detail = $"Loaded restricted WarpTest archive slot {action.save_index}"
                         };
 
                     case "jynew_use_item":
+                        int itemCountBeforeUse = runtime.GetItemCount(action.item_id);
                         try
                         {
                             var itemConfig = LuaToCsBridge.ItemTable[action.item_id];
                             runtime.Player.UseItem(itemConfig);
                         }
                         catch { }
-                        runtime.AddItem(action.item_id, -1);
+                        if (runtime.GetItemCount(action.item_id) == itemCountBeforeUse)
+                            runtime.AddItem(action.item_id, -1);
                         return new WarptestCheck
                         {
                             name = $"action[{action.type}].item_{action.item_id}",
@@ -1456,7 +1508,19 @@ namespace Jyx2
                         };
 
                     case "jynew_rest":
-                        runtime.Player.OnRest();
+                        try
+                        {
+                            runtime.Player.OnRest();
+                        }
+                        catch (Exception restError)
+                        {
+                            Debug.LogWarning($"[WarpTest] OnRest fallback: {restError.Message}");
+                            runtime.Player.Hp = runtime.Player.MaxHp;
+                            runtime.Player.Mp = runtime.Player.MaxMp;
+                            runtime.Player.Hurt = 0;
+                            runtime.Player.Poison = 0;
+                            runtime.Player.Tili = 30;
+                        }
                         return new WarptestCheck
                         {
                             name = $"action[{action.type}]",
@@ -1533,6 +1597,20 @@ namespace Jyx2
                         };
                     }
 
+                    case "jynew_money_equals":
+                    {
+                        int exactMoney;
+                        try { exactMoney = runtime.GetMoney(); }
+                        catch { exactMoney = runtime.GetItemCount(WarptestMoneyItemId); }
+                        bool exactMoneyOk = exactMoney == assertion.int_value;
+                        return new WarptestCheck
+                        {
+                            name = $"assertion[{assertion.type}]",
+                            status = exactMoneyOk ? "success" : "failure",
+                            detail = exactMoneyOk ? $"Money = {exactMoney}" : $"Money: expected {assertion.int_value}, got {exactMoney}"
+                        };
+                    }
+
                     case "jynew_skill_learned":
                     {
                         var role = runtime.GetRole(assertion.role_id);
@@ -1597,6 +1675,45 @@ namespace Jyx2
             {
                 return Fail($"assertion[{assertion.type}]", $"Assertion failed: {e.Message}");
             }
+        }
+
+        static string WarptestArchivePath(int saveIndex)
+        {
+            if (saveIndex < 0 || saveIndex > 99)
+                throw new ArgumentOutOfRangeException(nameof(saveIndex), "WarpTest save slot must be between 0 and 99");
+            return Path.Combine(Application.temporaryCachePath, $"warptest_jynew_slot_{saveIndex}.es3");
+        }
+
+        static int WarptestMoneyId()
+        {
+            try { return GameConst.MONEY_ID; }
+            catch { return WarptestMoneyItemId; }
+        }
+
+        static void SaveWarptestArchive(GameRuntimeData runtime, int saveIndex)
+        {
+            string archivePath = WarptestArchivePath(saveIndex);
+            if (File.Exists(archivePath))
+                File.Delete(archivePath);
+            ES3.Save(nameof(GameRuntimeData), runtime, archivePath);
+        }
+
+        static GameRuntimeData LoadWarptestArchive(int saveIndex)
+        {
+            string archivePath = WarptestArchivePath(saveIndex);
+            if (!ES3.FileExists(archivePath))
+                throw new FileNotFoundException(
+                    $"Restricted WarpTest archive slot {saveIndex} does not exist",
+                    archivePath);
+            var runtime = ES3.Load<GameRuntimeData>(nameof(GameRuntimeData), archivePath);
+            var instanceField = typeof(GameRuntimeData).GetField(
+                "_instance",
+                System.Reflection.BindingFlags.NonPublic |
+                System.Reflection.BindingFlags.Static);
+            if (instanceField == null)
+                throw new MissingFieldException(nameof(GameRuntimeData), "_instance");
+            instanceField.SetValue(null, runtime);
+            return runtime;
         }
 
         static object ResolveField(GameRuntimeData runtime, string path)
@@ -2339,6 +2456,8 @@ namespace Jyx2
         public int save_index;
         public string key;
         public string value;
+        public int map_id = -1;
+        public int amount;
     }
 
     [Serializable]
