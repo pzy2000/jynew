@@ -190,7 +190,7 @@ Material:
     - _ShadowColor: {r: 0.3066038, g: 0.45068616, b: 1, a: 1}
     - _SpecColor: {r: 1, g: 1, b: 1, a: 0.5}
     - _TheFlashColor: {r: 0, g: 0, b: 0, a: 0}
-    - _WaterColor: {r: 0.050976053, g: 0.054897003, b: 0.63529414, a: 1}
-    - _WaterShallowColor: {r: 0.20390117, g: 0.20390117, b: 0.9882353, a: 1}
+    - _WaterColor: {r: 0.050976038, g: 0.05489698, b: 0.63529414, a: 1}
+    - _WaterShallowColor: {r: 0.20390114, g: 0.20390114, b: 0.9882353, a: 1}
     - _WaveDirection: {r: 1, g: 0, b: 0, a: 0}
   m_BuildTextureStacks: []

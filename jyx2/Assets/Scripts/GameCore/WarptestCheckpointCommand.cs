@@ -94,14 +94,12 @@ namespace Jyx2
             {
                 IntPtr application = ObjcMessage(
                     objc_getClass("NSApplication"), sel_registerName("sharedApplication"));
-                // NSApplicationActivationPolicyAccessory keeps the headed editor
-                // renderable without allowing it to displace the user's front app.
-                ObjcMessageInteger(application, sel_registerName("setActivationPolicy:"), 1);
-                ObjcMessageVoid(application, sel_registerName("deactivate"));
+                // Interactive headed play: NSApplicationActivationPolicyRegular.
+                ObjcMessageInteger(application, sel_registerName("setActivationPolicy:"), 0);
             }
             catch (Exception e)
             {
-                Debug.LogError($"[WarpTest C1] Unable to enforce background activation policy: {e.Message}");
+                Debug.LogError($"[WarpTest C1] Unable to enforce activation policy: {e.Message}");
                 throw;
             }
 #endif
