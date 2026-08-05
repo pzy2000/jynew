@@ -94,12 +94,14 @@ namespace Jyx2
             {
                 IntPtr application = ObjcMessage(
                     objc_getClass("NSApplication"), sel_registerName("sharedApplication"));
-                // Interactive headed play: NSApplicationActivationPolicyRegular.
-                ObjcMessageInteger(application, sel_registerName("setActivationPolicy:"), 0);
+                // NSApplicationActivationPolicyAccessory keeps the headed editor
+                // renderable without allowing it to displace the user's front app.
+                ObjcMessageInteger(application, sel_registerName("setActivationPolicy:"), 1);
+                ObjcMessageVoid(application, sel_registerName("deactivate"));
             }
             catch (Exception e)
             {
-                Debug.LogError($"[WarpTest C1] Unable to enforce activation policy: {e.Message}");
+                Debug.LogError($"[WarpTest C1] Unable to enforce background activation policy: {e.Message}");
                 throw;
             }
 #endif
@@ -843,14 +845,33 @@ namespace Jyx2
             };
         }
 
+        // Dimensions of the surface the last capture actually read back, so the
+        // driver can reject a frame that could not fill the 1280x720 policy frame
+        // instead of silently upscaling a partial readback.
+        static int s_lastCaptureSourceWidth;
+        static int s_lastCaptureSourceHeight;
+
         static string CaptureScreenshotToFile(string outputPath)
         {
+            s_lastCaptureSourceWidth = 0;
+            s_lastCaptureSourceHeight = 0;
             if (Application.isPlaying)
             {
                 var source = ScreenCapture.CaptureScreenshotAsTexture();
                 Texture2D texture = null;
                 try
                 {
+                    // ScreenCapture reads back Screen.width/height, which on a
+                    // Retina Editor GameView is half the real framebuffer in each
+                    // axis and yields the bottom-left quarter of the frame. A
+                    // readback that cannot fill the policy frame is discarded here
+                    // and the camera path below renders the whole view instead.
+                    if (source != null && (source.width < 1280 || source.height < 720))
+                    {
+                        Debug.LogWarning($"[WarpTest] Discarding {source.width}x{source.height} ScreenCapture readback; rendering the camera at 1280x720 instead.");
+                        UnityEngine.Object.Destroy(source);
+                        source = null;
+                    }
                     if (source != null)
                     {
                         texture = new Texture2D(1280, 720, TextureFormat.RGB24, false);
@@ -870,6 +891,8 @@ namespace Jyx2
                         File.WriteAllBytes(outputPath, texture.EncodeToPNG());
                         if (TextureHasVisibleRange(texture))
                         {
+                            s_lastCaptureSourceWidth = source.width;
+                            s_lastCaptureSourceHeight = source.height;
                             Debug.Log("[WarpTest] Screenshot captured via ScreenCapture.");
                             return $"ScreenCapture captured final GameView pixels including overlay UI and normalized {source.width}x{source.height} to 1280x720.";
                         }
@@ -1045,6 +1068,11 @@ namespace Jyx2
                 File.WriteAllBytes(outputPath, texture.EncodeToPNG());
                 bool informative = TextureHasVisibleRange(texture);
                 DestroyCapturedObject(texture);
+                if (informative)
+                {
+                    s_lastCaptureSourceWidth = width;
+                    s_lastCaptureSourceHeight = height;
+                }
                 detail = informative ? "Camera render captured an informative image." : "Camera render produced a blank or flat image.";
                 return informative;
             }
@@ -2048,6 +2076,8 @@ namespace Jyx2
                         report.frame_id = s_c1PolicyFrameId;
                         report.frame_width = 1280;
                         report.frame_height = 720;
+                        report.capture_source_width = s_lastCaptureSourceWidth;
+                        report.capture_source_height = s_lastCaptureSourceHeight;
                         checks.Add(new WarptestCheck
                         {
                             name = "c1.live_capture",
@@ -2314,6 +2344,8 @@ namespace Jyx2
         public int frame_id = -1;
         public int frame_width;
         public int frame_height;
+        public int capture_source_width;
+        public int capture_source_height;
         public string batch_id;
         public bool accepted;
         public int event_count;
