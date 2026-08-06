@@ -845,9 +845,8 @@ namespace Jyx2
             };
         }
 
-        // Dimensions of the surface the last capture actually read back, so the
-        // driver can reject a frame that could not fill the 1280x720 policy frame
-        // instead of silently upscaling a partial readback.
+        // Dimensions of the full frame the last capture rendered, so the driver
+        // can reject stale instrumentation or a policy-frame size drift.
         static int s_lastCaptureSourceWidth;
         static int s_lastCaptureSourceHeight;
 
@@ -855,58 +854,11 @@ namespace Jyx2
         {
             s_lastCaptureSourceWidth = 0;
             s_lastCaptureSourceHeight = 0;
-            if (Application.isPlaying)
-            {
-                var source = ScreenCapture.CaptureScreenshotAsTexture();
-                Texture2D texture = null;
-                try
-                {
-                    // ScreenCapture reads back Screen.width/height, which on a
-                    // Retina Editor GameView is half the real framebuffer in each
-                    // axis and yields the bottom-left quarter of the frame. A
-                    // readback that cannot fill the policy frame is discarded here
-                    // and the camera path below renders the whole view instead.
-                    if (source != null && (source.width < 1280 || source.height < 720))
-                    {
-                        Debug.LogWarning($"[WarpTest] Discarding {source.width}x{source.height} ScreenCapture readback; rendering the camera at 1280x720 instead.");
-                        UnityEngine.Object.Destroy(source);
-                        source = null;
-                    }
-                    if (source != null)
-                    {
-                        texture = new Texture2D(1280, 720, TextureFormat.RGB24, false);
-                        var sourcePixels = source.GetPixels32();
-                        var normalizedPixels = new Color32[1280 * 720];
-                        for (int y = 0; y < 720; y++)
-                        {
-                            int sourceY = Math.Min(source.height - 1, y * source.height / 720);
-                            for (int x = 0; x < 1280; x++)
-                            {
-                                int sourceX = Math.Min(source.width - 1, x * source.width / 1280);
-                                normalizedPixels[y * 1280 + x] = sourcePixels[sourceY * source.width + sourceX];
-                            }
-                        }
-                        texture.SetPixels32(normalizedPixels);
-                        texture.Apply();
-                        File.WriteAllBytes(outputPath, texture.EncodeToPNG());
-                        if (TextureHasVisibleRange(texture))
-                        {
-                            s_lastCaptureSourceWidth = source.width;
-                            s_lastCaptureSourceHeight = source.height;
-                            Debug.Log("[WarpTest] Screenshot captured via ScreenCapture.");
-                            return $"ScreenCapture captured final GameView pixels including overlay UI and normalized {source.width}x{source.height} to 1280x720.";
-                        }
-                    }
-                }
-                finally
-                {
-                    if (texture != null)
-                        UnityEngine.Object.Destroy(texture);
-                    if (source != null)
-                        UnityEngine.Object.Destroy(source);
-                }
-            }
-
+            // Never use ScreenCapture here. In a Retina Editor GameView it can
+            // return a 1280x720 bottom-left quadrant of a 2560x1440 framebuffer;
+            // that partial readback is large enough to pass an output-size check.
+            // The camera path renders the complete scene and temporarily binds
+            // Screen Space Overlay canvases into the same fixed policy frame.
             string cameraDetail;
             if (TryCaptureCameraToFile(outputPath, out cameraDetail))
                 return "Camera render captured final GameView pixels with Screen Space Overlay canvases at 1280x720. " + cameraDetail;
